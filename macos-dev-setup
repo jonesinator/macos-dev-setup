@@ -1,0 +1,233 @@
+#!/usr/bin/env bash
+# Setup script for macOS to make local web development easier.
+#
+# This allows local DNS/TLS to be administered without requiring any superuser access other than
+# one specific access which is explicitly allowed. Note that configuring things this way probably
+# does make you more vulnerable to some attacks since it leaves DNS spoofing pretty open on your
+# machine, so use carefully. Essentially, this allows you to have nice URLs like
+# "https://example.foo" or "https://bar.wow" that validate as trusted by the system with very little
+# effort.
+#
+# Primarily, the setup consists of the following actions.
+#
+# 1. Installs Homebrew, if not already installed, to allow installation of other software.
+#
+# 2. Establishes a trusted root certificate using cfssl, which can be used for local TLS.
+#
+#    The certificate is at ~/.local/share/ca/root.pem. This is added to the macOS System keychain.
+#    The private key is at ~/.local/share/ca/root-key.pem. Needed to sign certificates.
+#    The ca config file is at ~/.local/share/ca/ca-config.json. Edit as needed.
+#
+# 3. Configures a local DNS server using unbound. This is a process that runs at boot.
+#
+#    The primary config file is at /opt/homebrew/etc/unbound/unbound.conf. Edit as needed.
+#    The user's config files are at ~/.local/share/dns/*.conf. Edit as needed.
+#
+#    Adds a file at /etc/sudoers.d/unbound, allowing "sudo brew services restart unbound" to be
+#    invoked without requiring a password.
+#
+#    The network interface with the default route is updated to use the unbound server.
+#
+# This prepares the system to easily allow custom local updates to DNS responses by editing, and
+# generating certificates by using cfssl. The next sections of the script, labelled "Example" show
+# a minimal version of these operations that you can create aliases for, or incorporate into your
+# automated workflows. The examples perform the following actions.
+#
+# 1. Creates an unbound config file establishing a "custom" TLD, where all A records for all
+#    subdomains point to 127.0.0.1. Restarts the unbound service as needed.
+#
+#    The config file is placed at ~/.local/share/dns/custom.conf.
+#
+# 2. Creates a key, certificate, and certificate chain file for "example.custom" in the current
+#    directory using cfssl.
+#
+#    The files are "chain.pem", "server.pem", and "server-key.pem".
+#
+# 3. Runs a self test by spawning a simple Python HTTPS server, and using curl to request
+#    https://example.custom:8443. If the request succeeds, everything is working.
+#
+# The files can from the example/test portion can be removed without issue:
+#    rm chain.pem server.pem server-key.pem ~/.local/share/dns/custom.conf
+#    sudo brew services restart unbound
+#
+# This script is designed to be idempotent, and should only make changes the first time it is run,
+# or if certain files are manually removed.
+set -euxo pipefail
+
+#
+# One-Time(ish) Setup
+#
+
+# Install Homebrew (https://brew.sh/) if not already installed.
+if ! command -v brew &>/dev/null; then
+  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+  echo >> ~/.zprofile
+  # shellcheck disable=SC2016
+  echo 'eval "$(/opt/homebrew/bin/brew shellenv)"' >> ~/.zprofile
+  eval "$(/opt/homebrew/bin/brew shellenv)"
+fi
+
+# Install cfssl (https://github.com/cloudflare/cfssl) if not already installed, and configure a
+# trusted root certificate.
+command -v cfssl &> /dev/null || brew install cfssl
+if [[ ! -f "${HOME}/.local/share/ca/root.pem" ]]; then
+  mkdir -p ~/.local/share/ca
+  cd ~/.local/share/ca
+  echo '{ "CN": "Local Development Root CA", "key": { "algo": "ecdsa", "curve": "p-256" }}' |
+    cfssl genkey -initca - | cfssljson -bare root
+  sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain root.pem
+fi
+
+# Create a new system user under which we will run the unbound process. (Requires interactive
+# prompts.)
+function new_id() { dscl . -list "${1}" "${2}" | awk '$2 > 300 && $2 < 500 {print $2}' | sort -n; }
+unbound_user=_unbound
+if ! id -u "${unbound_user}" &> /dev/null; then
+  new_uid="$(comm -23 <(seq 301 499) <(new_id /Users UniqueID) | head -1)"
+  new_gid="$(comm -23 <(seq 301 499) <(new_id /Groups PrimaryGroupID) | head -1)"
+  sudo dscl . -create "/Groups/${unbound_user}" PrimaryGroupID "${new_gid}"
+  sudo sysadminctl -addUser "${unbound_user}" -UID "${new_uid}" -GID "${new_gid}" \
+    -shell /usr/bin/false -home /var/empty
+fi
+
+# Install unbound (https://www.nlnetlabs.nl/projects/unbound/about/) if not already installed, and
+# configure it to run locally and only allow local IP addresses to query it. The user can place
+# additional config files at ~/.local/share/dns/*.conf. Any queries not handled locally will be
+# forwarded to 1.1.1.1. (Requires interactive prompts.)
+command -v unbound &> /dev/null || brew install unbound
+if ! grep -q ".local/share/dns" /opt/homebrew/etc/unbound/unbound.conf; then
+  sudo tee /opt/homebrew/etc/unbound/unbound.conf >/dev/null << EOF
+server:
+    interface: 127.0.0.1
+    username: ${unbound_user}
+    access-control: 10.0.0.0/8 allow
+    access-control: 127.0.0.0/8 allow
+    access-control: 172.16.0.0/12 allow
+    access-control: 192.168.0.0/16 allow
+    include: ${HOME}/.local/share/dns/*.conf
+forward-zone:
+    name: "."
+    forward-addr: 1.1.1.1@53
+EOF
+  sudo chown -R "${unbound_user}:${unbound_user}" /opt/homebrew/etc/unbound
+  sudo chmod 644 /opt/homebrew/etc/unbound/*
+  mkdir -p ~/.local/share/dns
+  sudo unbound-checkconf
+fi
+
+# Install jq if not already installed. This is needed to parse the Homebrew output.
+command -v jq &> /dev/null || brew install jq
+
+# Start the unbound service if it is not already running. (Requires interactive prompts.)
+if [[ "$(sudo brew services info unbound --json | jq '.[0].running')" != "true" ]]; then
+  sudo brew services start unbound
+fi
+
+# Configure sudo to allow any user in the "staff" group to run "brew services restart unbound".
+if [[ ! -f /etc/sudoers.d/unbound ]]; then
+  sudo tee /etc/sudoers.d/unbound > /dev/null << EOF
+%staff ALL=(root:wheel) NOPASSWD:NOSETENV: $(command -v brew) services restart unbound
+EOF
+  sudo chmod 644 /etc/sudoers.d/unbound
+fi
+
+# Configure the active network interface to use unbound.
+# Warning: This unconditionally clobbers any existing configuration.
+#
+# To clear the config, use this command (replacing Wi-Fi with your interface):
+#    sudo networksetup -setdnsservers "Wi-Fi" empty
+#
+# To set the config, use this command (replacing Wi-Fi with your interface, and 1.2.3.4 with your
+# desired DNS server):
+#    sudo networksetup -setdnsservers "Wi-Fi" 1.2.3.4
+active_interface="$(route get default | grep interface | awk '{print $2}')"
+active_port="$(networksetup -listallhardwareports |
+  grep "^Device: ${active_interface}$" -B 1 | head -1 | awk '{print $NF}')"
+if [[ "$(networksetup -getdnsservers "${active_port}")" != "127.0.0.1" ]]; then
+  # Show the old value in case the user wants to undo this operation.
+  networksetup -getdnsservers "${active_port}"
+  sudo networksetup -setdnsservers "${active_port}" 127.0.0.1
+fi
+
+# Write a simple cfssl certificate authority configuration file with a single profile for
+# webservers. For intermediate CAs, client certificates, and other things, you will need to add
+# profiles to this configuration.
+if [[ ! -f "${HOME}/.local/share/ca/ca-config.json" ]]; then
+  cat << EOF >> ~/.local/share/ca/ca-config.json
+{
+  "signing": {
+    "default": {
+      "expiry": "8760h"
+    },
+    "profiles": {
+      "server": {
+        "usages": ["signing", "digital signing", "key encipherment", "server auth"],
+        "expiry": "8760h"
+      }
+    }
+  }
+}
+EOF
+fi
+
+#
+# DNS Changes (Example)
+#
+# Simply add/remove/update files in ~/.local/share/dns. When you're ready for the changes to go
+# live, run "sudo brew services restart unbound". While this does require superuser access, 
+#
+
+# Write an unbound configuration that points all subdomains of the "custom" TLD to 127.0.0.1, and
+# restart the service for the change to take effect.
+if [[ ! -f "${HOME}/.local/share/dns/custom.conf" ]]; then
+  mkdir -p ~/.local/share/dns
+  cat << EOF >> ~/.local/share/dns/custom.conf
+local-zone: "custom." redirect
+local-data: "custom. IN A 127.0.0.1"
+EOF
+  sudo brew services restart unbound
+fi
+
+#
+# Certificate Generation (Example)
+#
+
+# Generate a key/certificate for "example.custom", and combine that with the root certificate to get
+# the certificate chain.
+if [[ ! -f chain.pem ]]; then
+  echo '{"CN":"example.custom","hosts":["example.custom"],"key":{"algo":"ecdsa","curve":"P-256"}}' \
+    | cfssl gencert \
+        -ca ~/.local/share/ca/root.pem \
+        -ca-key ~/.local/share/ca/root-key.pem \
+        -config ~/.local/share/ca/ca-config.json \
+        -profile server \
+        - \
+          | cfssljson -bare server
+  cat server.pem ~/.local/share/ca/root.pem > chain.pem
+fi
+
+#
+# Self-Test (Example)
+#
+
+# Start a simple python https server in the background using the key and certificate chain generated
+# earlier. Then, while that is running, try to access that server through the URL
+# "https://example.custom:8443" and expect that the certificate validates without the need for the
+# "--insecure" flag. This shows that both DNS and TLS are working to create a valid request for
+# curl.
+python3 << EOF &
+import http.server
+import ssl
+httpd = http.server.HTTPServer(('', 8443), http.server.SimpleHTTPRequestHandler)
+ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ssl_context.load_cert_chain(certfile="chain.pem", keyfile="server-key.pem")
+httpd.socket = ssl_context.wrap_socket(httpd.socket, server_side=True)
+httpd.serve_forever()
+EOF
+server_pid="${!}"
+sleep 1
+curl https://example.custom:8443
+kill "${server_pid}"
+
+# If we made it this far then the request succeeded.
+echo "macOS configured successfully"
