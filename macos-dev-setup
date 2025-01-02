@@ -123,10 +123,13 @@ if [[ "$(sudo brew services info unbound --json | jq '.[0].running')" != "true" 
   sudo brew services start unbound
 fi
 
-# Configure sudo to allow any user in the "staff" group to run "brew services restart unbound".
+# Configure sudo to allow any user in the "staff" group to run the commands needed to restart the
+# DNS server, flush the DNS cache, and restart the Apple DNS responder processes.
 if [[ ! -f /etc/sudoers.d/unbound ]]; then
   sudo tee /etc/sudoers.d/unbound > /dev/null << EOF
 %staff ALL=(root:wheel) NOPASSWD:NOSETENV: $(command -v brew) services restart unbound
+%staff ALL=(root:wheel) NOPASSWD:NOSETENV: $(command -v dscacheutil) -flushcache
+%staff ALL=(root:wheel) NOPASSWD:NOSETENV: $(command -v killall) -HUP mDNSResponder
 EOF
   sudo chmod 644 /etc/sudoers.d/unbound
 fi
@@ -173,8 +176,14 @@ fi
 #
 # DNS Changes (Example)
 #
-# Simply add/remove/update files in ~/.local/share/dns. When you're ready for the changes to go
-# live, run "sudo brew services restart unbound". While this does require superuser access, 
+# Add/remove/update files in ~/.local/share/dns. When you're ready for the changes to go live,
+# run these commands:
+#   sudo brew services restart unbound
+#   sudo dscacheutil -flushcache
+#   sudo killall -HUP mDNSResponder
+#
+# While these commands do require superuser access, they have been explicitly allowed by the sudoers
+# config above, so should not request a password.
 #
 
 # Write an unbound configuration that points all subdomains of the "custom" TLD to 127.0.0.1, and
@@ -186,6 +195,8 @@ local-zone: "custom." redirect
 local-data: "custom. IN A 127.0.0.1"
 EOF
   sudo brew services restart unbound
+  sudo dscacheutil -flushcache
+  sudo killall -HUP mDNSResponder
 fi
 
 #

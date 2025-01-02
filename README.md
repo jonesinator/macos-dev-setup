@@ -42,10 +42,13 @@ top-level configuration file at `/opt/homebrew/etc/unbound/unbound.conf`, but th
 superuser access and as such is more difficult to automate. Anything you can do in the toplevel file
 can be delegated to an included file, though, so this is not a real limitation.
 
-Once you have edited the config files and want to make the changes live, run the following command:
+Once you have edited the config files and want to make the changes live, run the following commands
+to restart unbound, and flush the DNS cache:
 
 ```sh
 sudo brew services restart unbound
+sudo dscacheutil -flushcache
+sudo killall -HUP mDNSResponder
 ```
 
 While this command does require `sudo`, it should not require entering a password, because the file
@@ -79,6 +82,8 @@ Once the files have been created run this command to restart the unbound server:
 
 ```sh
 sudo brew services restart unbound
+sudo dscacheutil -flushcache
+sudo killall -HUP mDNSResponder
 ```
 
 Now you should be able to run the following commands and see the following responses.
@@ -93,11 +98,13 @@ dig +short wow.bar
 10.11.11.11
 ```
 
-To undo these changes, simply run these commands:
+To undo these changes, run these commands:
 
 ```sh
 rm ~/.local/share/dns/foo.conf ~/.local/share/dns/bar.conf
 sudo brew services restart unbound
+sudo dscacheutil -flushcache
+sudo killall -HUP mDNSResponder
 ```
 
 ## Generating Certificates
@@ -132,7 +139,7 @@ cat foo.pem ~/.local/share/ca/root.pem > chain.pem
 Now `chain.pem` and `foo-key.pem` should be compatible with any TLS server that can be configured to
 identify as the host `example.foo`.
 
-To undo these changes, simply remove the files:
+To undo these changes, remove the files:
 
 ```sh
 rm chain.pem foo.pem foo-key.pem
